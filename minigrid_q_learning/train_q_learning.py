@@ -124,6 +124,7 @@ def main() -> None:
     epsilon = args.epsilon_start
     rewards_window: list[float] = []
     success_window: list[int] = []
+    all_rewards: list[float] = []
 
     for episode in range(1, args.episodes + 1):
         obs, info = env.reset(seed=args.seed + episode)
@@ -152,6 +153,7 @@ def main() -> None:
 
         rewards_window.append(episode_reward)
         success_window.append(episode_success)
+        all_rewards.append(episode_reward)
         if len(rewards_window) > args.log_every:
             rewards_window.pop(0)
             success_window.pop(0)
@@ -176,6 +178,16 @@ def main() -> None:
     print(f"\nSaved Q-table to: {args.save_path}")
     print(f"Evaluation over 100 episodes: mean_return={mean_return:.3f}, success_rate={success_rate:.2%}")
 
+    import matplotlib.pyplot as plt
+    window_size = 100
+    smoothed_rewards = np.convolve(all_rewards, np.ones(window_size)/window_size, mode='valid')
+
+    plt.plot(smoothed_rewards)
+    plt.xlabel("Episodes")
+    plt.ylabel("Average Reward")
+    plt.title(f"Smoothed Reward vs Episodes ({ENV_ID})")
+    plt.legend()
+    plt.show()
 
 if __name__ == "__main__":
     main()
