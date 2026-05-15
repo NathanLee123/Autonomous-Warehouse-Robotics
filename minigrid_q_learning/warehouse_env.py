@@ -1,27 +1,8 @@
 #!/usr/bin/env python3
-"""Custom MiniGrid warehouse environments for reinforcement learning experiments.
+"""Custom warehouse grid environment for MiniGrid.
 
-This module defines a family of warehouse-style grid environments where an
-agent must:
-    - navigate around shelf obstacles
-    - pick up a package
-    - deliver it to a goal/drop-off location
-
-Features:
-    - procedurally generated warehouse aisle layouts
-    - custom pickup package object with modified rendering
-    - reward shaping for navigation progress and successful delivery
-    - multiple environment sizes ranging from tiny to large
-    - compatibility with MiniGrid and Gymnasium APIs
-
-Included environments:
-    - WarehouseGridTiny
-    - WarehouseGridSmall
-    - WarehouseGridMedium
-    - WarehouseGridLarge
-
-These environments are designed for experimenting with tabular Q-learning
-and other reinforcement learning algorithms in structured navigation tasks.
+This creates a warehouse-like layout with shelves arranged in aisles,
+suitable for Q-learning training.
 """
 
 from __future__ import annotations
@@ -34,7 +15,7 @@ from minigrid.core.grid import Grid
 from minigrid.core.mission import MissionSpace
 from minigrid.minigrid_env import MiniGridEnv
 from minigrid.core.world_object import Ball, Goal, Wall
-from minigrid.utils.rendering import fill_coords, point_in_circle
+from minigrid.utils.rendering import fill_coords, point_in_circle, point_in_rect
 
 
 class Package(Ball):
@@ -47,6 +28,30 @@ class Package(Ball):
         # Use a pink-looking fill even though the internal color uses a supported code.
         pink = (255, 102, 204)
         fill_coords(img, point_in_circle(0.5, 0.5, 0.31), pink)
+
+
+class HumanObstacle(Wall):
+    """Moving red human obstacle that blocks the agent's path."""
+
+    def __init__(self):
+        # Keep the encoded object type wall-compatible so MiniGrid observations
+        # remain valid, but render it as a red human icon.
+        super().__init__(color="red")
+
+    def render(self, img):
+        red = (220, 20, 60)
+        dark_red = (120, 0, 0)
+
+        # Head
+        fill_coords(img, point_in_circle(0.5, 0.25, 0.14), red)
+        # Body
+        fill_coords(img, point_in_rect(0.40, 0.60, 0.36, 0.72), red)
+        # Arms
+        fill_coords(img, point_in_rect(0.23, 0.40, 0.42, 0.52), red)
+        fill_coords(img, point_in_rect(0.60, 0.77, 0.42, 0.52), red)
+        # Legs
+        fill_coords(img, point_in_rect(0.38, 0.48, 0.70, 0.95), dark_red)
+        fill_coords(img, point_in_rect(0.52, 0.62, 0.70, 0.95), dark_red)
 
 
 class WarehouseGridEnv(MiniGridEnv):
@@ -79,13 +84,14 @@ class WarehouseGridEnv(MiniGridEnv):
         super().__init__(
             mission_space=mission_space,
             grid_size=width,
-            max_steps=6 * width * height,
+            max_steps=2 * width * height,
             render_mode=render_mode,
             see_through_walls=(render_mode == "human"),
         )
 
         self.width = width
         self.height = height
+        self.human_pos: tuple[int, int] | None = None
 
     def _gen_grid(self, width: int, height: int) -> None:
         """Generate the warehouse grid with shelves, aisles, and dock areas."""
@@ -128,15 +134,51 @@ class WarehouseGridEnv(MiniGridEnv):
         self.goal_pos = sample_empty_position(exclude={tuple(self.agent_pos), self.package_pos}, min_dist=4)
         self.grid.set(*self.goal_pos, Goal())
 
+        self.human_pos = sample_empty_position(
+            exclude={tuple(self.agent_pos), self.package_pos, self.goal_pos},
+            min_dist=2,
+        )
+        self.grid.set(*self.human_pos, HumanObstacle())
+
+    def _is_empty_for_human(self, pos: tuple[int, int]) -> bool:
+        if pos == tuple(self.agent_pos) or pos == self.package_pos or pos == self.goal_pos:
+            return False
+        x, y = pos
+        return 0 <= x < self.width and 0 <= y < self.height and self.grid.get(x, y) is None
+
+    def _move_human_obstacle(self) -> None:
+        """Move the human one random valid step while preserving a solvable grid."""
+        if self.human_pos is None:
+            return
+
+        x, y = self.human_pos
+        candidates = [(x, y), (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+        self.np_random.shuffle(candidates)
+
+        for next_pos in candidates:
+            if next_pos == self.human_pos or self._is_empty_for_human(next_pos):
+                self.grid.set(x, y, None)
+                self.human_pos = next_pos
+                self.grid.set(*self.human_pos, HumanObstacle())
+                return
+
+    def _agent_is_facing_human(self) -> bool:
+        return self.human_pos is not None and tuple(self.front_pos) == self.human_pos
+
     def step(self, action: int):
         prev_carrying = self.carrying
         prev_agent_pos = tuple(self.agent_pos)
         prev_target = self.goal_pos if prev_carrying is not None else self.package_pos
         prev_target_dist = abs(prev_target[0] - prev_agent_pos[0]) + abs(prev_target[1] - prev_agent_pos[1])
+        attempted_human_collision = action == self.actions.forward and self._agent_is_facing_human()
 
         obs, reward, terminated, truncated, info = super().step(action)
 
         agent_pos = tuple(self.agent_pos)
+
+        if attempted_human_collision:
+            reward -= 2.0
+            info["hit_human"] = True
 
         if action == self.actions.pickup and self.carrying is not None and prev_carrying is None:
             reward += 1.0
@@ -156,6 +198,9 @@ class WarehouseGridEnv(MiniGridEnv):
             current_dist = abs(current_target[0] - agent_pos[0]) + abs(current_target[1] - agent_pos[1])
             reward += 0.05 * (prev_target_dist - current_dist)
             reward -= 0.01
+
+        if not terminated and not truncated:
+            self._move_human_obstacle()
 
         return obs, reward, terminated, truncated, info
 

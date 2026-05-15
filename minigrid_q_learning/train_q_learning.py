@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
-"""Train and evaluate a tabular Q-learning agent on MiniGrid and custom warehouse environments.
+"""Train a tabular Q-learning agent on MiniGrid-Empty-5x5-v0.
 
-The agent learns using a compact handcrafted state representation that includes:
-    - agent direction
-    - relative target position
-    - whether the package has been picked up
-    - local wall/blockage information
+This example intentionally uses a compact state representation:
+    (agent_x, agent_y, agent_dir)
 
-Supported environments include:
-    - MiniGrid empty and lava tasks
-    - custom WarehouseGrid environments of varying sizes
-
-The script:
-    - trains a Q-table with epsilon-greedy exploration
-    - evaluates the learned policy
-    - saves the trained Q-table to disk
-    - plots smoothed training rewards over time
-
-This implementation is designed as a lightweight educational baseline for
-tabular reinforcement learning experiments.
+That makes tabular Q-learning feasible on a simple MiniGrid task.
+It is a good educational baseline, but it will not scale well to harder,
+partially observed tasks like DoorKey without richer state handling.
 """
 
 from __future__ import annotations
@@ -34,7 +22,7 @@ import minigrid
 from minigrid.core.world_object import Goal
 from warehouse_env import WarehouseGridSmall, WarehouseGridTiny, WarehouseGridMedium, WarehouseGridLarge
 
-VALID_ACTIONS = (0, 1, 2, 3)  # left, right, forward, pickup
+VALID_ACTIONS = (0, 1, 2, 3, 6)  # left, right, forward, pickup, wait
 
 ENV_DEFAULTS = {
     "WarehouseGridTiny-v0": {
@@ -185,8 +173,14 @@ def _is_blocked(base_env: gym.Env, pos: tuple[int, int]) -> int:
     x, y = pos
     if x < 0 or x >= base_env.width or y < 0 or y >= base_env.height:
         return 1
+    if getattr(base_env, "human_pos", None) == pos:
+        return 1
     cell = base_env.grid.get(x, y)
     return int(cell is not None and cell.type == "wall")
+
+
+def get_human_position(env: gym.Env) -> tuple[int, int] | None:
+    return getattr(env.unwrapped, "human_pos", None)
 
 
 def get_state(env: gym.Env) -> tuple[int, ...]:
@@ -216,35 +210,153 @@ def get_state(env: gym.Env) -> tuple[int, ...]:
     blocked_left = _is_blocked(base_env, left_pos)
     blocked_right = _is_blocked(base_env, right_pos)
 
-    return direction, dx, dy, int(picked), blocked_front, blocked_left, blocked_right
+    human_pos = get_human_position(env)
+    if human_pos is None:
+        human_dx = 0
+        human_dy = 0
+        human_front = 0
+        human_left = 0
+        human_right = 0
+    else:
+        human_dx = _normalize_offset(human_pos[0] - int(x))
+        human_dy = _normalize_offset(human_pos[1] - int(y))
+        human_front = int(front_pos == human_pos)
+        human_left = int(left_pos == human_pos)
+        human_right = int(right_pos == human_pos)
 
+    return (
+        direction,
+        dx,
+        dy,
+        int(picked),
+        blocked_front,
+        blocked_left,
+        blocked_right,
+        human_dx,
+        human_dy,
+        human_front,
+        human_left,
+        human_right,
+    )
 
 def epsilon_greedy_action(
     q_table: defaultdict,
     state: tuple[int, ...],
     epsilon: float,
     rng: np.random.Generator,
+    env: gym.Env,
+    previous_action: int | None = None,
+    repeated_turns: int = 0,
+    position_loop: bool = False,
 ) -> int:
+    valid_actions = get_valid_actions(env, previous_action)
+
+    if 3 in valid_actions:
+        return 3
+
+    if position_loop:
+        escape_actions = [a for a in valid_actions if a != 6]
+        return int(rng.choice(escape_actions))
+
+    if repeated_turns >= 3:
+        if 2 in valid_actions:
+            return 2
+        if state[9] == 1 and 6 in valid_actions:
+            return 6
+
     if rng.random() < epsilon:
-        return int(rng.choice(VALID_ACTIONS))
+        return int(rng.choice(valid_actions))
 
     q_values = q_table[state]
-    valid_q_values = q_values[list(VALID_ACTIONS)]
+    valid_q_values = q_values[valid_actions]
     best_value = float(np.max(valid_q_values))
-    best_actions = [VALID_ACTIONS[i] for i, q in enumerate(valid_q_values) if q == best_value]
+    best_actions = [
+        action for action in valid_actions
+        if float(q_values[action]) == best_value
+    ]
+
     return int(rng.choice(best_actions))
 
+def get_front_cell(env: gym.Env):
+    base_env = env.unwrapped
+    front_pos = tuple(base_env.front_pos)
+    return front_pos, base_env.grid.get(*front_pos)
 
-def choose_action(q_table: defaultdict, state: tuple[int, ...], rng: np.random.Generator) -> int:
+
+def package_is_in_front(env: gym.Env) -> bool:
+    base_env = env.unwrapped
+    front_pos, front_cell = get_front_cell(env)
+
+    if getattr(base_env, "carrying", None) is not None:
+        return False
+
+    if hasattr(base_env, "package_pos"):
+        return front_pos == tuple(base_env.package_pos)
+
+    return front_cell is not None and front_cell.type == "ball"
+
+def get_valid_actions(env: gym.Env, previous_action: int | None = None) -> list[int]:
+    base_env = env.unwrapped
+    front_pos, front_cell = get_front_cell(env)
+
+    valid_actions = [0, 1]  # left, right
+
+    front_is_wall = front_cell is not None and front_cell.type == "wall"
+    front_is_human = getattr(base_env, "human_pos", None) == front_pos
+
+    if front_is_human:
+        valid_actions.append(6)  # wait only for human
+
+    if not front_is_wall and not front_is_human:
+        valid_actions.append(2)  # forward
+
+    if package_is_in_front(env):
+        valid_actions.append(3)  # pickup
+
+    if previous_action == 0 and 1 in valid_actions and len(valid_actions) > 1:
+        valid_actions.remove(1)
+    elif previous_action == 1 and 0 in valid_actions and len(valid_actions) > 1:
+        valid_actions.remove(0)
+
+    return valid_actions
+
+def choose_action(
+    q_table: dict,
+    state: tuple[int, ...],
+    rng: np.random.Generator,
+    env: gym.Env,
+    previous_action: int | None = None,
+    repeated_turns: int = 0,
+    position_loop: bool = False,
+) -> int:
+    valid_actions = get_valid_actions(env, previous_action)
+
+    # Always pick up the package when it is directly in front.
+    if 3 in valid_actions:
+        return 3
+
+    if position_loop:
+        escape_actions = [a for a in valid_actions if a != 6]
+        return int(rng.choice(escape_actions))
+
+    if repeated_turns >= 3:
+        if 2 in valid_actions:
+            return 2
+        if state[9] == 1 and 6 in valid_actions:
+            return 6
+
     q_values = q_table.get(state)
     if q_values is None:
-        return int(rng.choice(VALID_ACTIONS))
+        return int(rng.choice(valid_actions))
 
-    valid_q_values = q_values[list(VALID_ACTIONS)]
+    valid_q_values = q_values[valid_actions]
     best_value = float(np.max(valid_q_values))
-    best_actions = [VALID_ACTIONS[i] for i, q in enumerate(valid_q_values) if q == best_value]
-    return int(rng.choice(best_actions))
+    best_actions = [
+        action for action in valid_actions
+        if float(q_values[action]) == best_value
+    ]
 
+    return int(rng.choice(best_actions))
 
 def evaluate_policy(q_table: defaultdict, env_id: str, episodes: int = 100, seed: int = 123) -> tuple[float, float]:
     env = make_env(env_id, render_mode=None)
@@ -259,15 +371,38 @@ def evaluate_policy(q_table: defaultdict, env_id: str, episodes: int = 100, seed
         done = False
         total_reward = 0.0
 
+        previous_action = None
+        repeated_turns = 0
+        recent_positions = []
+
         while not done:
-            action = choose_action(q_table, state, rng)
+            position_loop = len(recent_positions) >= 12 and len(set(recent_positions)) <= 3
+            action = choose_action(q_table, state, rng, env, previous_action, repeated_turns, position_loop)
+
             obs, reward, terminated, truncated, info = env.step(action)
+
+            agent_pos = tuple(env.unwrapped.agent_pos)
+            recent_positions.append(agent_pos)
+            if len(recent_positions) > 12:
+                recent_positions.pop(0)
+
+            if info.get("success", False):
+                success_count += 1
+
             del obs, info
+
+            if action in (0, 1) and previous_action == action:
+                repeated_turns += 1
+            elif action in (0, 1):
+                repeated_turns = 1
+            else:
+                repeated_turns = 0
+
+            previous_action = action
+
             state = get_state(env)
             total_reward += float(reward)
             done = terminated or truncated
-            if terminated and reward > 0:
-                success_count += 1
 
         returns.append(total_reward)
 
@@ -287,7 +422,7 @@ def main() -> None:
     env = make_env(args.env, render_mode=None)
 
     # Default each unseen state to a 7-action zero vector, matching MiniGrid's action space.
-    q_table: defaultdict[tuple[int, int, int], np.ndarray] = defaultdict(
+    q_table: defaultdict[tuple[int, ...], np.ndarray] = defaultdict(
         lambda: np.zeros(env.action_space.n, dtype=np.float32)
     )
 
@@ -304,9 +439,33 @@ def main() -> None:
         episode_reward = 0.0
         episode_success = 0
 
+        previous_action = None
+        repeated_turns = 0
+        recent_positions = []
+
         while not done:
-            action = epsilon_greedy_action(q_table, state, epsilon, rng)
+            position_loop = len(recent_positions) >= 12 and len(set(recent_positions)) <= 3
+            action = epsilon_greedy_action(q_table, state, epsilon, rng, env, previous_action, repeated_turns, position_loop)
+
             obs, reward, terminated, truncated, info = env.step(action)
+
+            agent_pos = tuple(env.unwrapped.agent_pos)
+            recent_positions.append(agent_pos)
+            if len(recent_positions) > 12:
+                recent_positions.pop(0)
+
+            if info.get("success", False):
+                episode_success += 1
+            
+            if action in (0, 1) and previous_action == action:
+                repeated_turns += 1
+            elif action in (0, 1):
+                repeated_turns = 1
+            else:
+                repeated_turns = 0
+
+            previous_action = action
+
             del obs, info
             next_state = get_state(env)
             done = terminated or truncated
@@ -318,8 +477,6 @@ def main() -> None:
 
             state = next_state
             episode_reward += float(reward)
-            if terminated and reward > 0:
-                episode_success = 1
 
         rewards_window.append(episode_reward)
         success_window.append(episode_success)
