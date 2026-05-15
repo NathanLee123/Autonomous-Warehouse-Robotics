@@ -70,3 +70,36 @@ python evaluate_q_learning.py --model-path q_table.pkl --episodes 10
 - This is a teaching example, not a high-performance RL baseline.
 - Restricting actions to left / right / forward speeds up learning.
 - For harder MiniGrid tasks, move from tabular Q-learning to DQN or PPO.
+
+## 🏪 NEW: Custom Warehouse Grid Environments
+
+We've added custom warehouse grid environments for more realistic agent training!
+
+### Available Warehouse Environments
+
+1. **WarehouseGridSmall-v0** (8×8) — Easy, good for learning
+2. **WarehouseGridMedium-v0** (12×12) — Medium difficulty
+3. **WarehouseGridLarge-v0** (16×16) — Hard, requires more training
+
+### Quick Start with Warehouse
+
+Train on a small warehouse:
+```bash
+python train_q_learning.py --env WarehouseGridSmall-v0 --episodes 5000 --save-path results/warehouse_q_table.pkl
+```
+
+Watch your agent navigate:
+```bash
+python evaluate_q_learning.py --env WarehouseGridSmall-v0 --model-path results/warehouse_q_table.pkl --episodes 5
+```
+
+### Warehouse Features
+
+- **Procedurally generated** warehouse layout with shelves (walls) and aisles
+- **Random agent & goal positions** each episode (more challenging than empty grid)
+- **Scalable complexity** — choose grid size and aisle width
+- **Real-world relevance** — more like actual warehouse navigation
+
+For detailed information, see:
+- [QUICKSTART.md](QUICKSTART.md) — Get started in 5 minutes
+- [WAREHOUSE_GUIDE.md](WAREHOUSE_GUIDE.md) — Full documentation and examples
